@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+ <!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8"/>
@@ -8,25 +8,24 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
 <meta name="apple-mobile-web-app-title" content="VOLBOT"/>
 <title>VOLBOT — Trading IA</title>
-<link rel="manifest" href="manifest.json"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 body{background:#070a12;font-family:'DM Sans',sans-serif;color:#e0e0e0;overscroll-behavior:none}
-input{font-family:'DM Mono',monospace}
+input,select{font-family:'DM Mono',monospace}
 input::placeholder{color:#333}
 ::-webkit-scrollbar{display:none}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 #00e5a040}50%{opacity:.7;box-shadow:0 0 0 8px transparent}}
 @keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-@keyframes slideUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:none}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
 .fade{animation:fadeIn .3s ease}
 .card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:18px;padding:16px;backdrop-filter:blur(12px)}
 .btn-main{width:100%;padding:16px;border-radius:14px;background:linear-gradient(135deg,#00e5a0,#0066ff);border:none;color:#000;font-size:15px;font-weight:700;cursor:pointer;font-family:'DM Sans',sans-serif;transition:opacity .2s}
 .btn-main:disabled{background:#1a1a2a;color:#444;cursor:default}
-.btn-ghost{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:12px;color:#aaa;font-family:'DM Sans',sans-serif;cursor:pointer;transition:all .2s}
-.loader{width:20px;height:20px;border:2px solid rgba(255,255,255,.1);border-top:2px solid #00e5a0;border-radius:50%;animation:spin .8s linear infinite;display:inline-block}
+.btn-ghost{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:12px;color:#aaa;font-family:'DM Sans',sans-serif;cursor:pointer}
+.loader{width:18px;height:18px;border:2px solid rgba(255,255,255,.1);border-top:2px solid #00e5a0;border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:middle}
 #root{min-height:100vh}
 </style>
 </head>
@@ -37,22 +36,45 @@ input::placeholder{color:#333}
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script type="text/babel" data-presets="react">
 const {useState,useEffect,useRef,useCallback}=React;
-
 const PAIRS=["BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT"];
-const SYSTEM_PROMPT=`Tu es VOLBOT, expert en analyse technique crypto. Retourne UNIQUEMENT un JSON valide sans markdown ni explication.
-Format STRICT:
-{"signal":"LONG"|"SHORT"|"WAIT","confidence":0-100,"volatility":number,"rsi":number,"reason":"max 80 chars","sl_pct":number,"tp_pct":number}
-Règles: LONG si vol élevée+RSI<38+tendance haussière. SHORT si vol élevée+RSI>62+tendance baissière. WAIT sinon.
-Ne jamais inventer des données. sl_pct entre 1.0-3.0, tp_pct entre 1.5-5.0`;
 
-// ── Storage ──
+// ── Sessions de trading (heures UTC) ──
+const SESSIONS={
+  london:{start:7,end:16,name:"London"},
+  newyork:{start:13,end:21,name:"New York"},
+  overlap:{start:13,end:16,name:"London+NY ⚡"}
+};
+
+// ── Prompt IA amélioré avec MACD + Bollinger ──
+const SYSTEM_PROMPT=`Tu es VOLBOT, expert en analyse technique crypto. Retourne UNIQUEMENT un JSON valide.
+Format STRICT:
+{"signal":"LONG"|"SHORT"|"WAIT","confidence":0-100,"volatility":number,"rsi":number,"macd_signal":"BULLISH"|"BEARISH"|"NEUTRAL","bollinger":"UPPER"|"LOWER"|"MIDDLE","reason":"max 80 chars","sl_pct":number,"tp_pct":number,"session_ok":boolean,"predicted_move_pct":number}
+Règles strictes:
+- LONG: vol élevée + RSI<38 + MACD BULLISH + prix proche Bollinger LOWER
+- SHORT: vol élevée + RSI>62 + MACD BEARISH + prix proche Bollinger UPPER  
+- WAIT sinon ou si confidence<65
+- Ne jamais inventer. sl_pct:1.0-2.5, tp_pct:1.5-5.0
+- predicted_move_pct: estimation du mouvement probable en %
+- Réduire sl_pct si plusieurs pertes récentes détectées`;
+
 const S={
   get:(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch{return d}},
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
 };
 
-// ── Binance Public API ──
-async function fetchKlines(pair,interval="5m",limit=50){
+// ── Telegram ──
+async function sendTelegram(token,chatId,msg){
+  if(!token||!chatId)return;
+  try{
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({chat_id:chatId,text:msg,parse_mode:"HTML"})
+    });
+  }catch(e){console.warn("Telegram:",e);}
+}
+
+// ── APIs Binance ──
+async function fetchKlines(pair,interval="5m",limit=60){
   const sym=pair.replace("/","");
   const r=await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
   if(!r.ok)throw new Error("Binance "+r.status);
@@ -60,25 +82,64 @@ async function fetchKlines(pair,interval="5m",limit=50){
 }
 async function fetchTicker(pair){
   const r=await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${pair.replace("/","")}`);
-  if(!r.ok)throw new Error("Ticker "+r.status);
+  if(!r.ok)throw new Error("Ticker");
   return r.json();
 }
 
-// ── Analyse IA ──
-async function analyzeWithAI(pair,candles){
-  const closes=candles.map(c=>c.close);
-  const lr=closes.slice(1).map((c,i)=>Math.log(c/closes[i]));
+// ── Indicateurs techniques ──
+function calcBollinger(closes,period=20){
+  const slice=closes.slice(-period);
+  const mean=slice.reduce((a,b)=>a+b,0)/period;
+  const std=Math.sqrt(slice.reduce((a,b)=>a+Math.pow(b-mean,2),0)/period);
+  const upper=mean+2*std, lower=mean-2*std;
+  const last=closes.at(-1);
+  if(last>=upper*0.999)return "UPPER";
+  if(last<=lower*1.001)return "LOWER";
+  return "MIDDLE";
+}
+function calcMACD(closes){
+  const ema=(arr,p)=>{
+    const k=2/(p+1);
+    return arr.reduce((prev,cur,i)=>i===0?cur:prev*( 1-k)+cur*k,arr[0]);
+  };
+  const ema12=ema(closes.slice(-26),12);
+  const ema26=ema(closes.slice(-26),26);
+  const macd=ema12-ema26;
+  const signal=ema(closes.slice(-9).map((_,i)=>ema(closes.slice(-26+i,-26+i+12||undefined),12)-ema(closes.slice(-26+i),26)),9);
+  if(macd>signal)return "BULLISH";
+  if(macd<signal)return "BEARISH";
+  return "NEUTRAL";
+}
+function isGoodSession(){
+  const h=new Date().getUTCHours();
+  return (h>=7&&h<=21); // London + NY combiné
+}
+function calcVolatility(closes,window=20){
+  const slice=closes.slice(-(window+1));
+  const lr=slice.slice(1).map((c,i)=>Math.log(c/slice[i]));
   const mean=lr.reduce((a,b)=>a+b,0)/lr.length;
-  const vol=Math.sqrt(lr.reduce((a,b)=>a+Math.pow(b-mean,2),0)/lr.length)*100;
+  return Math.sqrt(lr.reduce((a,b)=>a+Math.pow(b-mean,2),0)/lr.length)*100;
+}
+
+// ── Analyse IA ──
+async function analyzeWithAI(pair,candles,recentLosses=0){
+  const closes=candles.map(c=>c.close);
+  const vol=calcVolatility(closes);
   const t5=((closes.at(-1)-closes.at(-5))/closes.at(-5))*100;
   const t20=((closes.at(-1)-closes.at(-20))/closes.at(-20))*100;
-  const data={pair,price:closes.at(-1).toFixed(4),vol_pct:vol.toFixed(4),trend5:t5.toFixed(3),trend20:t20.toFixed(3),
+  const bollinger=calcBollinger(closes);
+  const macd=calcMACD(closes);
+  const sessionOk=isGoodSession();
+  const data={pair,price:closes.at(-1).toFixed(4),
+    vol_pct:vol.toFixed(4),trend5:t5.toFixed(3),trend20:t20.toFixed(3),
+    bollinger_position:bollinger,macd_direction:macd,
+    session_active:sessionOk,recent_losses:recentLosses,
     high20:Math.max(...candles.slice(-20).map(c=>c.high)).toFixed(4),
     low20:Math.min(...candles.slice(-20).map(c=>c.low)).toFixed(4),
     last5closes:closes.slice(-5).map(c=>c.toFixed(4))};
   const resp=await fetch("https://api.anthropic.com/v1/messages",{
     method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:500,
+    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:600,
       system:SYSTEM_PROMPT,
       messages:[{role:"user",content:"Analyse:\n"+JSON.stringify(data,null,2)}]})
   });
@@ -87,7 +148,7 @@ async function analyzeWithAI(pair,candles){
   return JSON.parse(txt);
 }
 
-// ── Mini Sparkline ──
+// ── Composants UI ──
 function Spark({candles,signal,h=48}){
   if(!candles?.length)return React.createElement("div",{style:{height:h}});
   const c=candles.map(x=>x.close);
@@ -96,18 +157,19 @@ function Spark({candles,signal,h=48}){
   const col=signal==="LONG"?"#00e5a0":signal==="SHORT"?"#ff4560":"#f5a623";
   return React.createElement("svg",{width:"100%",height:h,viewBox:`0 0 ${W} ${h}`,preserveAspectRatio:"none"},
     React.createElement("defs",null,
-      React.createElement("linearGradient",{id:"sg",x1:"0",y1:"0",x2:"0",y2:"1"},
+      React.createElement("linearGradient",{id:"sg"+signal,x1:"0",y1:"0",x2:"0",y2:"1"},
         React.createElement("stop",{offset:"0%",stopColor:col,stopOpacity:"0.3"}),
         React.createElement("stop",{offset:"100%",stopColor:col,stopOpacity:"0"}))),
-    React.createElement("polygon",{points:`0,${h} ${pts} ${W},${h}`,fill:"url(#sg)"}),
+    React.createElement("polygon",{points:`0,${h} ${pts} ${W},${h}`,fill:`url(#sg${signal})`}),
     React.createElement("polyline",{points:pts,fill:"none",stroke:col,strokeWidth:"1.8",strokeLinejoin:"round"}));
 }
 
-// ── Badge signal ──
 function Badge({signal,lg}){
-  const cfg={LONG:{bg:"#00e5a015",bd:"#00e5a0",cl:"#00e5a0",lb:"▲ LONG"},
+  const cfg={
+    LONG:{bg:"#00e5a015",bd:"#00e5a0",cl:"#00e5a0",lb:"▲ LONG"},
     SHORT:{bg:"#ff456015",bd:"#ff4560",cl:"#ff4560",lb:"▼ SHORT"},
-    WAIT:{bg:"#ffffff08",bd:"#ffffff20",cl:"#555",lb:"— ATTENTE"}};
+    WAIT:{bg:"#ffffff08",bd:"#ffffff20",cl:"#555",lb:"— ATTENTE"}
+  };
   const c=cfg[signal]||cfg.WAIT;
   return React.createElement("span",{style:{
     background:c.bg,border:`1px solid ${c.bd}`,color:c.cl,
@@ -116,21 +178,20 @@ function Badge({signal,lg}){
     fontFamily:"'DM Mono',monospace",whiteSpace:"nowrap"}},c.lb);
 }
 
-// ── Toast ──
 function Toast({msg,onClose}){
-  useEffect(()=>{if(msg){const t=setTimeout(onClose,4000);return()=>clearTimeout(t)}},[msg]);
+  useEffect(()=>{if(msg){const t=setTimeout(onClose,5000);return()=>clearTimeout(t)}},[msg]);
   if(!msg)return null;
   return React.createElement("div",{style:{
     position:"fixed",bottom:90,left:"50%",transform:"translateX(-50%)",
     background:msg.type==="error"?"#ff456022":"#00e5a022",
     border:`1px solid ${msg.type==="error"?"#ff4560":"#00e5a0"}`,
     color:"#fff",borderRadius:12,padding:"12px 20px",fontSize:13,
-    backdropFilter:"blur(16px)",zIndex:999,maxWidth:"88vw",textAlign:"center",
-    fontWeight:500,animation:"fadeIn .3s ease"}},msg.text);
+    backdropFilter:"blur(16px)",zIndex:999,maxWidth:"88vw",
+    textAlign:"center",fontWeight:500,animation:"fadeIn .3s ease"}},msg.text);
 }
 
 // ════════════════════════════════════════════
-// ÉCRAN SETUP
+// SETUP
 // ════════════════════════════════════════════
 function Setup({onSave}){
   const [exch,setExch]=useState("BINANCE");
@@ -142,78 +203,111 @@ function Setup({onSave}){
   const [tp,setTp]=useState("3.0");
   const [wallet,setWallet]=useState("");
   const [net,setNet]=useState("TRC20");
+  const [tgToken,setTgToken]=useState("");
+  const [tgChat,setTgChat]=useState("");
+  const [maxPos,setMaxPos]=useState("3");
+  const [sessionOnly,setSessionOnly]=useState(true);
+  const [autoWithdraw,setAutoWithdraw]=useState("0");
   const [step,setStep]=useState(1);
 
   const inp={width:"100%",background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.12)",
     borderRadius:12,color:"#fff",padding:"14px 16px",fontSize:14,outline:"none",
     fontFamily:"'DM Mono',monospace"};
   const lbl={fontSize:11,color:"#888",letterSpacing:".1em",marginBottom:6,display:"block"};
+  const toggle=(val,set,label)=>React.createElement("div",{
+    onClick:()=>set(!val),
+    style:{display:"flex",justifyContent:"space-between",alignItems:"center",
+      padding:"12px 16px",background:"rgba(255,255,255,.04)",borderRadius:12,cursor:"pointer"}},
+    React.createElement("span",{style:{fontSize:13,color:"#ccc"}},label),
+    React.createElement("div",{style:{width:44,height:24,borderRadius:12,
+      background:val?"#00e5a0":"#333",transition:"all .3s",position:"relative"}},
+      React.createElement("div",{style:{width:20,height:20,borderRadius:"50%",background:"#fff",
+        position:"absolute",top:2,left:val?22:2,transition:"left .3s"}})));
+
+  const steps=[
+    {t:"Exchange & API",i:"🔌"},
+    {t:"Capital & Risque",i:"💰"},
+    {t:"Telegram & Wallet",i:"📱"},
+    {t:"Options avancées",i:"⚙️"}
+  ];
 
   const save=()=>{
     if(!key||!sec)return;
-    onSave({exchange:exch,apiKey:key,secret:sec,capital:+cap,risk:+risk,sl:+sl,tp:+tp,wallet,network:net});
+    onSave({exchange:exch,apiKey:key,secret:sec,capital:+cap,risk:+risk,
+      sl:+sl,tp:+tp,wallet,network:net,
+      tgToken,tgChat,maxPositions:+maxPos,
+      sessionOnly,autoWithdrawPct:+autoWithdraw});
   };
 
-  const steps=[{t:"Exchange & API",i:"🔌"},{t:"Capital & Risque",i:"💰"},{t:"Wallet USDT",i:"🏦"}];
-
   return React.createElement("div",{style:{minHeight:"100vh",background:"#070a12",paddingBottom:40}},
-    // Header
-    React.createElement("div",{style:{padding:"56px 24px 24px",textAlign:"center"}},
-      React.createElement("div",{style:{width:68,height:68,borderRadius:22,margin:"0 auto 16px",
+    React.createElement("div",{style:{padding:"52px 24px 20px",textAlign:"center"}},
+      React.createElement("div",{style:{width:68,height:68,borderRadius:22,margin:"0 auto 14px",
         background:"linear-gradient(135deg,#00e5a0,#0066ff)",display:"flex",alignItems:"center",
-        justifyContent:"center",fontSize:30,boxShadow:"0 0 50px #00e5a050"}},
-        "⚡"),
-      React.createElement("div",{style:{fontSize:26,fontWeight:800,color:"#fff",letterSpacing:"-.02em"}},"VOLBOT"),
-      React.createElement("div",{style:{fontSize:12,color:"#444",marginTop:4,letterSpacing:".15em"}},"ROBOT DE TRADING IA")),
+        justifyContent:"center",fontSize:30,boxShadow:"0 0 50px #00e5a050"}},"⚡"),
+      React.createElement("div",{style:{fontSize:24,fontWeight:800,color:"#fff"}},"VOLBOT"),
+      React.createElement("div",{style:{fontSize:11,color:"#444",marginTop:4,letterSpacing:".15em"}},"ROBOT DE TRADING IA v2.0")),
     // Progress
-    React.createElement("div",{style:{display:"flex",gap:8,padding:"0 24px 24px"}},
+    React.createElement("div",{style:{display:"flex",gap:6,padding:"0 24px 20px"}},
       steps.map((_,i)=>React.createElement("div",{key:i,onClick:()=>setStep(i+1),style:{
-        flex:1,height:4,borderRadius:2,cursor:"pointer",transition:"background .3s",
+        flex:1,height:4,borderRadius:2,cursor:"pointer",
         background:step>i?"linear-gradient(90deg,#00e5a0,#0066ff)":"rgba(255,255,255,.08)"}}))
     ),
-    // Content
     React.createElement("div",{style:{padding:"0 20px",display:"flex",flexDirection:"column",gap:14}},
-      React.createElement("div",{style:{fontSize:18,fontWeight:700,color:"#fff",marginBottom:4}},
+      React.createElement("div",{style:{fontSize:16,fontWeight:700,color:"#fff",marginBottom:4}},
         steps[step-1].i+" "+steps[step-1].t),
 
-      // Step 1
+      // Step 1 — Exchange
       step===1&&React.createElement(React.Fragment,null,
         React.createElement("div",null,
           React.createElement("span",{style:lbl},"EXCHANGE"),
           React.createElement("div",{style:{display:"flex",gap:10}},
             ["BINANCE","LATOKEN"].map(e=>React.createElement("button",{key:e,onClick:()=>setExch(e),style:{
               flex:1,padding:"13px 0",borderRadius:12,fontWeight:700,fontSize:13,
-              fontFamily:"'DM Mono',monospace",cursor:"pointer",transition:"all .2s",
+              fontFamily:"'DM Mono',monospace",cursor:"pointer",
               background:exch===e?"linear-gradient(135deg,#00e5a022,#0066ff22)":"transparent",
               border:`1px solid ${exch===e?"#00e5a0":"rgba(255,255,255,.1)"}`,
               color:exch===e?"#00e5a0":"#555"}},e)))),
         React.createElement("div",null,React.createElement("span",{style:lbl},"CLÉ API"),
           React.createElement("input",{type:"password",value:key,onChange:e=>setKey(e.target.value),
-            placeholder:"Collez votre clé API ici",style:inp})),
+            placeholder:"Collez votre clé API",style:inp})),
         React.createElement("div",null,React.createElement("span",{style:lbl},"SECRET KEY"),
           React.createElement("input",{type:"password",value:sec,onChange:e=>setSec(e.target.value),
-            placeholder:"Collez votre secret ici",style:inp})),
+            placeholder:"Collez votre secret",style:inp})),
         React.createElement("div",{className:"card",style:{background:"#ff456010",borderColor:"#ff456030"}},
           React.createElement("div",{style:{fontSize:12,color:"#ff9090",lineHeight:1.7}},
-            "⚠️ Créez vos clés sur Binance avec uniquement les droits ",
-            React.createElement("b",null,"Lecture + Trade Spot"),
-            ". Ne cochez jamais \"Retraits\"."))),
+            "⚠️ Droits requis: ",React.createElement("b",null,"Lecture + Trade Spot uniquement"),". Ne cochez jamais Retraits."))),
 
-      // Step 2
+      // Step 2 — Capital
       step===2&&React.createElement(React.Fragment,null,
         React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}},
-          [["CAPITAL TOTAL (USDT)",cap,setCap],["RISQUE / TRADE (%)",risk,setRisk],
-           ["STOP-LOSS (%)",sl,setSl],["TAKE-PROFIT (%)",tp,setTp]].map(([l,v,fn])=>
+          [["CAPITAL (USDT)",cap,setCap],["RISQUE / TRADE (%)",risk,setRisk],
+           ["STOP-LOSS (%)",sl,setSl],["TAKE-PROFIT (%)",tp,setTp],
+           ["MAX POSITIONS",maxPos,setMaxPos]].map(([l,v,fn])=>
             React.createElement("div",{key:l},
               React.createElement("span",{style:lbl},l),
               React.createElement("input",{type:"number",value:v,onChange:e=>fn(e.target.value),style:inp})))),
         React.createElement("div",{className:"card"},
           React.createElement("div",{style:{fontSize:13,color:"#aaa",lineHeight:1.8}},
-            "💡 Le bot risque ",React.createElement("b",{style:{color:"#00e5a0"}},
-            (+cap*(+risk)/100).toFixed(2)+" USDT")," par trade. SL: ",sl,"% | TP: ",tp,"%"))),
+            "💡 Risque par trade: ",
+            React.createElement("b",{style:{color:"#00e5a0"}},(+cap*(+risk)/100).toFixed(2)+" USDT"),
+            " | Max positions: ",React.createElement("b",{style:{color:"#00e5a0"}},maxPos)))),
 
-      // Step 3
+      // Step 3 — Telegram + Wallet
       step===3&&React.createElement(React.Fragment,null,
+        React.createElement("div",{className:"card",style:{borderColor:"#0066ff40",background:"#0066ff08"}},
+          React.createElement("div",{style:{fontSize:11,color:"#0099ff",letterSpacing:".1em",marginBottom:12}},"📱 ALERTES TELEGRAM"),
+          React.createElement("div",{style:{fontSize:12,color:"#888",marginBottom:12,lineHeight:1.6}},
+            "Recevez LONG/SHORT/TP/SL sur votre téléphone en temps réel"),
+          React.createElement("div",{style:{marginBottom:10}},
+            React.createElement("span",{style:lbl},"TOKEN BOTFATHER"),
+            React.createElement("input",{type:"password",value:tgToken,
+              onChange:e=>setTgToken(e.target.value),
+              placeholder:"1234567890:AAFxxx...",style:inp})),
+          React.createElement("div",null,
+            React.createElement("span",{style:lbl},"VOTRE CHAT ID"),
+            React.createElement("input",{type:"text",value:tgChat,
+              onChange:e=>setTgChat(e.target.value),
+              placeholder:"123456789",style:inp}))),
         React.createElement("div",null,
           React.createElement("span",{style:lbl},"RÉSEAU USDT"),
           React.createElement("div",{style:{display:"flex",gap:8}},
@@ -224,25 +318,36 @@ function Setup({onSave}){
               border:`1px solid ${net===n?"#00e5a0":"rgba(255,255,255,.1)"}`,
               color:net===n?"#00e5a0":"#555"}},n)))),
         React.createElement("div",null,
-          React.createElement("span",{style:lbl},"VOTRE ADRESSE WALLET (pour les profits)"),
+          React.createElement("span",{style:lbl},"ADRESSE WALLET (profits)"),
           React.createElement("input",{value:wallet,onChange:e=>setWallet(e.target.value),
-            placeholder:net==="TRC20"?"T...":"0x...",style:inp})),
-        React.createElement("div",{style:{fontSize:11,color:"#555",lineHeight:1.6,padding:"0 4px"}},
-          net==="TRC20"?"✓ TRC20 : frais ≈ 1$ · Le plus utilisé":
-          net==="ERC20"?"✓ ERC20 : frais ≈ 5$ · Très sécurisé":
-          "✓ BEP20 : frais ≈ 0.5$ · Le moins cher")),
+            placeholder:net==="TRC20"?"T...":"0x...",style:inp}))),
 
-      // Nav buttons
+      // Step 4 — Options avancées
+      step===4&&React.createElement(React.Fragment,null,
+        toggle(sessionOnly,setSessionOnly,"📅 Trader seulement London + NY sessions"),
+        React.createElement("div",{className:"card"},
+          React.createElement("div",{style:{fontSize:11,color:"#555",marginBottom:8}},"AUTO-RETRAIT DES PROFITS (%)"),
+          React.createElement("div",{style:{fontSize:12,color:"#888",marginBottom:10},
+          },"Retirer automatiquement quand profit ≥ X% du capital (0 = désactivé)"),
+          React.createElement("input",{type:"number",value:autoWithdraw,
+            onChange:e=>setAutoWithdraw(e.target.value),
+            placeholder:"0",style:inp})),
+        React.createElement("div",{className:"card",style:{background:"#00e5a008",borderColor:"#00e5a030"}},
+          React.createElement("div",{style:{fontSize:12,color:"#00e5a0",lineHeight:1.8}},
+            "✅ Algorithme: Volatilité + RSI + MACD + Bollinger\n\n",
+            "✅ Gestion risque dynamique après pertes\n\n",
+            "✅ Sessions London + New York\n\n",
+            "✅ Alertes Telegram temps réel\n\n",
+            "✅ Retrait automatique des profits"))),
+
+      // Navigation
       React.createElement("div",{style:{display:"flex",gap:12,marginTop:8}},
         step>1&&React.createElement("button",{onClick:()=>setStep(s=>s-1),
-          className:"btn-ghost",style:{flex:1,padding:16,fontSize:15,fontWeight:600}},
-          "← Retour"),
-        step<3
-          ?React.createElement("button",{onClick:()=>setStep(s=>s+1),className:"btn-main",style:{flex:2}},
-            "Suivant →")
+          className:"btn-ghost",style:{flex:1,padding:16,fontSize:15,fontWeight:600}},"← Retour"),
+        step<4
+          ?React.createElement("button",{onClick:()=>setStep(s=>s+1),className:"btn-main",style:{flex:2}},"Suivant →")
           :React.createElement("button",{onClick:save,className:"btn-main",
-            disabled:!key||!sec,style:{flex:2}},
-            "✅ Démarrer VOLBOT"))
+            disabled:!key||!sec,style:{flex:2}},"✅ Démarrer VOLBOT"))
     )
   );
 }
@@ -262,14 +367,22 @@ function App(){
   const [detail,setDetail]=useState(null);
   const [pnl,setPnl]=useState(S.get("volbot_pnl",0));
   const [depAddr,setDepAddr]=useState("");
+  const [sessionActive,setSessionActive]=useState(isGoodSession());
+  const [consecutiveLosses,setConsecutiveLosses]=useState(S.get("volbot_losses",0));
+  const [weeklyPnl,setWeeklyPnl]=useState(S.get("volbot_weekly",[0,0,0,0,0,0,0]));
   const intv=useRef(null);
+  const sessionIntv=useRef(null);
 
   const toast2=(text,type="info")=>setToast({text,type});
 
-  // Charger marché
+  const tg=useCallback((msg)=>{
+    if(config?.tgToken&&config?.tgChat)
+      sendTelegram(config.tgToken,config.tgChat,msg);
+  },[config]);
+
   const loadPair=useCallback(async(pair)=>{
     try{
-      const [k,t]=await Promise.all([fetchKlines(pair),fetchTicker(pair)]);
+      const [k,t]=await Promise.all([fetchKlines(pair,"5m",60),fetchTicker(pair)]);
       setMarkets(prev=>({...prev,[pair]:{
         candles:k,price:+t.lastPrice,change:+t.priceChangePercent,
         high24:+t.highPrice,low24:+t.lowPrice,vol:+t.quoteVolume,
@@ -277,11 +390,72 @@ function App(){
     }catch(e){console.warn(pair,e);}
   },[]);
 
-  useEffect(()=>{PAIRS.forEach(p=>loadPair(p));},[]);
+  useEffect(()=>{
+    PAIRS.forEach(p=>loadPair(p));
+    sessionIntv.current=setInterval(()=>setSessionActive(isGoodSession()),60000);
+    return()=>clearInterval(sessionIntv.current);
+  },[]);
 
-  // Boucle bot
+  // Gestion risque dynamique
+  const getRiskMultiplier=useCallback(()=>{
+    if(consecutiveLosses>=3)return 0.5;
+    if(consecutiveLosses>=2)return 0.75;
+    return 1.0;
+  },[consecutiveLosses]);
+
+  const openPos=useCallback((pair,analysis,price)=>{
+    const mult=getRiskMultiplier();
+    const amt=config.capital*(config.risk/100)*mult;
+    const sl=analysis.signal==="LONG"?price*(1-analysis.sl_pct/100):price*(1+analysis.sl_pct/100);
+    const tp=analysis.signal==="LONG"?price*(1+analysis.tp_pct/100):price*(1-analysis.tp_pct/100);
+    const pos={id:Date.now(),pair,side:analysis.signal,entry:price,sl,tp,
+      qty:amt/price,usdt:amt,confidence:analysis.confidence,
+      reason:analysis.reason,time:new Date().toLocaleTimeString(),
+      predicted:analysis.predicted_move_pct};
+    const updated=[...positions,pos];
+    setPositions(updated);S.set("volbot_positions",updated);
+    const emoji=analysis.signal==="LONG"?"🟢":"🔴";
+    const riskNote=mult<1?` ⚠️ Risque réduit (×${mult})`:"";
+    toast2(`${emoji} Position ouverte ${pair}${riskNote}`);
+    tg(`${emoji} <b>SIGNAL ${analysis.signal}</b> — ${pair}\n💰 Entrée: <code>${price.toFixed(4)}</code>\n🎯 TP: <code>${tp.toFixed(4)}</code>\n🛑 SL: <code>${sl.toFixed(4)}</code>\n📊 Confiance: ${analysis.confidence}%\n💡 ${analysis.reason}${riskNote}`);
+  },[config,positions,getRiskMultiplier,tg]);
+
+  const closPos=useCallback((pos,exit,reason)=>{
+    const gain=pos.side==="LONG"?(exit-pos.entry)*pos.qty:(pos.entry-exit)*pos.qty;
+    const tr={...pos,exit,pnl:gain,reason,closeTime:new Date().toLocaleTimeString()};
+    const np=positions.filter(p=>p.id!==pos.id);
+    const nt=[tr,...trades].slice(0,100);
+    const np2=pnl+gain;
+    // Gestion pertes consécutives
+    let losses=gain<0?consecutiveLosses+1:0;
+    setConsecutiveLosses(losses);
+    S.set("volbot_losses",losses);
+    // PnL hebdomadaire
+    const day=new Date().getDay();
+    const newWeekly=[...weeklyPnl];
+    newWeekly[day]=(newWeekly[day]||0)+gain;
+    setWeeklyPnl(newWeekly);S.set("volbot_weekly",newWeekly);
+    setPositions(np);setTrades(nt);setPnl(np2);
+    S.set("volbot_positions",np);S.set("volbot_trades",nt);S.set("volbot_pnl",np2);
+    const emoji=gain>=0?"✅":"❌";
+    toast2(`${emoji} ${reason} ${pos.pair} → ${gain>=0?"+":""}${gain.toFixed(3)} USDT`);
+    tg(`${emoji} <b>TRADE FERMÉ</b> — ${pos.pair}\n📌 ${pos.side} | ${reason}\n💰 ${pos.entry?.toFixed(4)} → ${exit?.toFixed(4)}\n${gain>=0?"🟢":"🔴"} P&L: <code>${gain>=0?"+":""}${gain.toFixed(4)} USDT</code>`);
+    // Auto-retrait si configuré
+    if(config?.autoWithdrawPct>0&&config?.wallet){
+      const profitPct=(np2/config.capital)*100;
+      if(profitPct>=config.autoWithdrawPct){
+        tg(`💸 <b>AUTO-RETRAIT DÉCLENCHÉ</b>\nProfit: ${profitPct.toFixed(1)}% ≥ ${config.autoWithdrawPct}%\nWallet: <code>${config.wallet}</code>`);
+      }
+    }
+  },[positions,trades,pnl,consecutiveLosses,weeklyPnl,config,tg]);
+
   const runBot=useCallback(async()=>{
     if(!botOn)return;
+    // Vérifier session si activé
+    if(config?.sessionOnly&&!isGoodSession()){
+      console.log("Hors session London/NY — en attente");
+      return;
+    }
     for(const pair of PAIRS){
       const m=markets[pair];if(!m?.candles)continue;
       const pos=positions.find(p=>p.pair===pair);
@@ -293,99 +467,91 @@ function App(){
         else if(pos.side==="SHORT"&&px<=pos.tp)closPos(pos,px,"🎯 Take-Profit");
         continue;
       }
+      if(positions.length>=(config?.maxPositions||3))continue;
       setLoading(l=>({...l,[pair]:true}));
       try{
-        const res=await analyzeWithAI(pair,m.candles);
+        const res=await analyzeWithAI(pair,m.candles,consecutiveLosses);
         setMarkets(prev=>({...prev,[pair]:{...prev[pair],signal:res.signal,analysis:res}}));
-        if(res.signal!=="WAIT"&&res.confidence>=60)openPos(pair,res,m.price);
+        if(res.signal!=="WAIT"&&res.confidence>=65)openPos(pair,res,m.price);
+        else if(res.signal!=="WAIT"&&res.confidence>=50){
+          // Signal faible — alerte seulement
+          tg(`⚠️ <b>SIGNAL FAIBLE</b> — ${pair}\n${res.signal} mais confiance trop basse (${res.confidence}%)\n💡 ${res.reason}`);
+        }
       }catch(e){console.warn(e);}
       finally{setLoading(l=>({...l,[pair]:false}));}
+      await new Promise(r=>setTimeout(r,2000)); // Délai entre analyses
     }
-  },[botOn,markets,positions]);
+  },[botOn,markets,positions,consecutiveLosses,config,openPos,closPos,tg]);
 
   useEffect(()=>{
     if(botOn){
       PAIRS.forEach(p=>loadPair(p));
+      tg("🤖 <b>VOLBOT DÉMARRÉ</b>\nSurveillance des marchés activée\nPaires: BTC, ETH, BNB, SOL, XRP");
       intv.current=setInterval(()=>{PAIRS.forEach(p=>loadPair(p));runBot();},30000);
       runBot();
-    }else clearInterval(intv.current);
+    }else{
+      clearInterval(intv.current);
+      if(config)tg("🛑 <b>VOLBOT ARRÊTÉ</b>");
+    }
     return()=>clearInterval(intv.current);
   },[botOn]);
 
   useEffect(()=>{if(botOn)runBot();},[markets]);
 
-  const openPos=(pair,analysis,price)=>{
-    const amt=config.capital*(config.risk/100);
-    const sl=analysis.signal==="LONG"?price*(1-analysis.sl_pct/100):price*(1+analysis.sl_pct/100);
-    const tp=analysis.signal==="LONG"?price*(1+analysis.tp_pct/100):price*(1-analysis.tp_pct/100);
-    const pos={id:Date.now(),pair,side:analysis.signal,entry:price,sl,tp,
-      qty:amt/price,usdt:amt,confidence:analysis.confidence,reason:analysis.reason,
-      time:new Date().toLocaleTimeString()};
-    const updated=[...positions,pos];
-    setPositions(updated);S.set("volbot_positions",updated);
-    toast2(`${analysis.signal==="LONG"?"🟢":"🔴"} Position ouverte ${pair}`);
-  };
-
-  const closPos=(pos,exit,reason)=>{
-    const gain=pos.side==="LONG"?(exit-pos.entry)*pos.qty:(pos.entry-exit)*pos.qty;
-    const tr={...pos,exit,pnl:gain,reason,closeTime:new Date().toLocaleTimeString()};
-    const np=positions.filter(p=>p.id!==pos.id);
-    const nt=[tr,...trades].slice(0,50);
-    const np2=pnl+gain;
-    setPositions(np);setTrades(nt);setPnl(np2);
-    S.set("volbot_positions",np);S.set("volbot_trades",nt);S.set("volbot_pnl",np2);
-    toast2(`${gain>=0?"✅":"❌"} ${reason} ${pair} → ${gain>=0?"+":""}${gain.toFixed(3)} USDT`);
-  };
-
   if(!config)return React.createElement(Setup,{onSave:cfg=>{S.set("volbot_config",cfg);setConfig(cfg);}});
 
   const wins=trades.filter(t=>t.pnl>0).length;
   const wr=trades.length?((wins/trades.length)*100).toFixed(0):0;
+  const avgWin=wins?trades.filter(t=>t.pnl>0).reduce((a,t)=>a+t.pnl,0)/wins:0;
+  const avgLoss=trades.length-wins?(trades.filter(t=>t.pnl<=0).reduce((a,t)=>a+Math.abs(t.pnl),0)/(trades.length-wins)):0;
+  const riskMult=getRiskMultiplier();
 
-  // ── Écran détail ──
+  // ── Détail paire ──
   if(detail){
     const m=markets[detail];
     const pos=positions.find(p=>p.pair===detail);
     const an=m?.analysis;
     const upnl=pos?(pos.side==="LONG"?(m?.price-pos.entry)*pos.qty:(pos.entry-m?.price)*pos.qty):0;
     return React.createElement("div",{className:"fade",style:{minHeight:"100vh",background:"#070a12",paddingBottom:100}},
-      // Header
-      React.createElement("div",{style:{display:"flex",alignItems:"center",gap:14,padding:"52px 20px 16px",
-        borderBottom:"1px solid rgba(255,255,255,.06)"}},
+      React.createElement("div",{style:{display:"flex",alignItems:"center",gap:14,
+        padding:"52px 20px 16px",borderBottom:"1px solid rgba(255,255,255,.06)",
+        position:"sticky",top:0,background:"rgba(7,10,18,.95)",backdropFilter:"blur(16px)",zIndex:50}},
         React.createElement("button",{onClick:()=>setDetail(null),style:{
           width:38,height:38,borderRadius:10,background:"rgba(255,255,255,.08)",
-          border:"none",color:"#fff",fontSize:20,cursor:"pointer"}},
-          "←"),
+          border:"none",color:"#fff",fontSize:20,cursor:"pointer"}},"←"),
         React.createElement("div",null,
-          React.createElement("div",{style:{fontSize:20,fontWeight:800,color:"#fff"}}),detail,
+          React.createElement("div",{style:{fontSize:20,fontWeight:800,color:"#fff"}},detail),
           React.createElement("div",{style:{fontSize:12,color:m?.change>=0?"#00e5a0":"#ff4560"}},
             (m?.change>=0?"▲":"▼")+" "+Math.abs(m?.change||0).toFixed(2)+"% · 24h")),
         React.createElement("div",{style:{marginLeft:"auto"}},
           loading[detail]?React.createElement("div",{className:"loader"}):React.createElement(Badge,{signal:m?.signal||"WAIT",lg:true}))),
       React.createElement("div",{style:{padding:"16px 20px",display:"flex",flexDirection:"column",gap:14}},
-        // Prix + chart
+        // Prix
         React.createElement("div",{className:"card"},
-          React.createElement("div",{style:{fontSize:30,fontWeight:800,color:"#fff",fontFamily:"'DM Mono',monospace"}},
+          React.createElement("div",{style:{fontSize:28,fontWeight:800,color:"#fff",fontFamily:"'DM Mono',monospace"}},
             m?.price?.toLocaleString("fr-FR",{maximumFractionDigits:detail.includes("XRP")?5:2}),
             React.createElement("span",{style:{fontSize:13,color:"#555",marginLeft:6}},"USDT")),
           React.createElement("div",{style:{margin:"12px 0"}},React.createElement(Spark,{candles:m?.candles,signal:m?.signal,h:80})),
           React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}},
             [["24h Haut",m?.high24?.toFixed(2)],["24h Bas",m?.low24?.toFixed(2)],
-             ["Vol (M$)",m?.vol?(m.vol/1e6).toFixed(1):"—"]].map(([l,v])=>
-              React.createElement("div",{key:l,style:{textAlign:"center"}},
+             ["Vol $M",m?.vol?(m.vol/1e6).toFixed(1):"—"]].map(([l,v])=>
+              React.createElement("div",{key:l,style:{textAlign:"center",background:"rgba(255,255,255,.03)",borderRadius:8,padding:"8px 6px"}},
                 React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:2}},l),
-                React.createElement("div",{style:{fontSize:13,color:"#ccc",fontFamily:"'DM Mono',monospace"}},v||"—"))))),
-        // Analyse IA
+                React.createElement("div",{style:{fontSize:12,color:"#ccc",fontFamily:"'DM Mono',monospace"}},v||"—"))))),
+        // Analyse IA complète
         an&&React.createElement("div",{className:"card"},
-          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"ANALYSE IA"),
+          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"ANALYSE IA — MULTI-INDICATEURS"),
           React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}},
             [["Confiance",an.confidence+"%",an.confidence>=70?"#00e5a0":"#f5a623"],
-             ["Volatilité",parseFloat(an.volatility).toFixed(3)+"%","#aaa"],
+             ["Volatilité",parseFloat(an.volatility||0).toFixed(3)+"%","#aaa"],
              ["RSI",an.rsi?.toFixed(1),an.rsi<38?"#00e5a0":an.rsi>62?"#ff4560":"#aaa"],
-             ["SL / TP",an.sl_pct+"% / "+an.tp_pct+"%","#aaa"]].map(([l,v,c])=>
+             ["MACD",an.macd_signal||"—",an.macd_signal==="BULLISH"?"#00e5a0":an.macd_signal==="BEARISH"?"#ff4560":"#aaa"],
+             ["Bollinger",an.bollinger||"—",an.bollinger==="LOWER"?"#00e5a0":an.bollinger==="UPPER"?"#ff4560":"#aaa"],
+             ["Mvt prévu",an.predicted_move_pct?(an.predicted_move_pct>0?"+":"")+an.predicted_move_pct?.toFixed(2)+"%":"—","#f5a623"]
+            ].map(([l,v,c])=>
               React.createElement("div",{key:l,style:{background:"rgba(255,255,255,.04)",borderRadius:10,padding:"10px 12px"}},
                 React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:4}},l),
-                React.createElement("div",{style:{fontSize:15,color:c,fontWeight:700,fontFamily:"'DM Mono',monospace"}},v)))),
+                React.createElement("div",{style:{fontSize:14,color:c,fontWeight:700,fontFamily:"'DM Mono',monospace"}},v)))),
           React.createElement("div",{style:{fontSize:12,color:"#888",fontStyle:"italic",lineHeight:1.5}},"💬 ",an.reason)),
         // Position active
         pos&&React.createElement("div",{className:"card",style:{borderColor:"rgba(0,229,160,.3)"}},
@@ -397,38 +563,37 @@ function App(){
              ["Take-Profit",pos.tp?.toFixed(4),"#00e5a0"]].map(([l,v,c])=>
               React.createElement("div",{key:l,style:{background:"rgba(255,255,255,.04)",borderRadius:10,padding:"10px 12px"}},
                 React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:4}},l),
-                React.createElement("div",{style:{fontSize:14,color:c,fontWeight:700,fontFamily:"'DM Mono',monospace"}},v)))),
+                React.createElement("div",{style:{fontSize:13,color:c,fontWeight:700,fontFamily:"'DM Mono',monospace"}},v)))),
           React.createElement("div",{style:{textAlign:"center",marginBottom:14}},
             React.createElement("div",{style:{fontSize:11,color:"#555",marginBottom:4}},"P&L NON RÉALISÉ"),
-            React.createElement("div",{style:{fontSize:26,fontWeight:900,color:upnl>=0?"#00e5a0":"#ff4560",fontFamily:"'DM Mono',monospace"}},
+            React.createElement("div",{style:{fontSize:24,fontWeight:900,color:upnl>=0?"#00e5a0":"#ff4560",fontFamily:"'DM Mono',monospace"}},
               (upnl>=0?"+":"")+upnl.toFixed(4)+" USDT")),
-          React.createElement("button",{onClick:()=>closPos(pos,m?.price||pos.entry,"Fermeture manuelle"),style:{
+          React.createElement("button",{onClick:()=>{closPos(pos,m?.price||pos.entry,"Fermeture manuelle");setDetail(null);},style:{
             width:"100%",padding:"13px 0",borderRadius:12,background:"#ff456018",
             border:"1px solid #ff456050",color:"#ff4560",fontSize:14,fontWeight:700,
-            cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
-            "⏹ Fermer manuellement")),
-        // Bouton analyser
+            cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},"⏹ Fermer manuellement")),
         React.createElement("button",{onClick:async()=>{
           if(!m?.candles)return;
           setLoading(l=>({...l,[detail]:true}));
           try{
-            const res=await analyzeWithAI(detail,m.candles);
+            const res=await analyzeWithAI(detail,m.candles,consecutiveLosses);
             setMarkets(prev=>({...prev,[detail]:{...prev[detail],signal:res.signal,analysis:res}}));
-            toast2("Analyse "+detail+": "+res.signal+" ("+res.confidence+"%)");
-          }catch(e){toast2("Erreur d'analyse","error");}
+            toast2(`${detail}: ${res.signal} (${res.confidence}%)`);
+          }catch(e){toast2("Erreur analyse","error");}
           finally{setLoading(l=>({...l,[detail]:false}));}
-        },disabled:loading[detail],className:"btn-main",style:{opacity:loading[detail]?.5:1}},
-          loading[detail]?React.createElement(React.Fragment,null,React.createElement("span",{className:"loader",style:{width:16,height:16,marginRight:8}}),"Analyse en cours…"):"🤖 Analyser maintenant")),
+        },disabled:loading[detail],className:"btn-main"},
+          loading[detail]?React.createElement(React.Fragment,null,React.createElement("span",{className:"loader",style:{width:14,height:14,marginRight:8}}),"Analyse…"):"🤖 Analyser maintenant")
+      ),
       React.createElement(Toast,{msg:toast,onClose:()=>setToast(null)}));
   }
 
-  // ── App principale ──
+  // ── Navigation ──
   const tabBtn=(t,ic,lb)=>React.createElement("button",{key:t,onClick:()=>setTab(t),style:{
     flex:1,padding:"8px 0",background:"none",border:"none",
     borderTop:`2px solid ${tab===t?"#00e5a0":"transparent"}`,
-    color:tab===t?"#00e5a0":"#444",fontSize:22,cursor:"pointer",transition:"all .2s"}},
+    color:tab===t?"#00e5a0":"#444",fontSize:20,cursor:"pointer"}},
     React.createElement("div",null,ic),
-    React.createElement("div",{style:{fontSize:9,marginTop:2,letterSpacing:".05em",color:tab===t?"#00e5a0":"#444"}},lb));
+    React.createElement("div",{style:{fontSize:9,marginTop:2,color:tab===t?"#00e5a0":"#444"}},lb));
 
   return React.createElement("div",{style:{minHeight:"100vh",background:"#070a12",paddingBottom:80}},
     // Header
@@ -443,13 +608,18 @@ function App(){
             boxShadow:botOn?"0 0 20px #00e5a060":"none"}},"⚡"),
           React.createElement("div",null,
             React.createElement("div",{style:{fontSize:17,fontWeight:800,color:"#fff"}},"VOLBOT"),
-            React.createElement("div",{style:{fontSize:10,color:"#444",letterSpacing:".1em"}},config.exchange))),
+            React.createElement("div",{style:{fontSize:10,letterSpacing:".1em",
+              color:sessionActive?"#00e5a0":"#555"}},
+              sessionActive?"● SESSION ACTIVE":"○ HORS SESSION"))),
         React.createElement("div",{style:{display:"flex",gap:10,alignItems:"center"}},
+          consecutiveLosses>=2&&React.createElement("div",{style:{
+            fontSize:10,color:"#f5a623",background:"#f5a62320",border:"1px solid #f5a62340",
+            borderRadius:20,padding:"4px 10px"}},`⚠️ ${consecutiveLosses} pertes`),
           botOn&&React.createElement("div",{style:{width:8,height:8,borderRadius:"50%",
             background:"#00e5a0",animation:"pulse 1.5s ease infinite"}}),
           React.createElement("button",{onClick:()=>setBotOn(v=>!v),style:{
-            padding:"9px 20px",borderRadius:20,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",
-            fontWeight:700,fontSize:12,transition:"all .2s",
+            padding:"9px 20px",borderRadius:20,cursor:"pointer",
+            fontFamily:"'DM Sans',sans-serif",fontWeight:700,fontSize:12,
             background:botOn?"#ff456020":"#00e5a020",
             border:`1px solid ${botOn?"#ff456060":"#00e5a060"}`,
             color:botOn?"#ff4560":"#00e5a0"}},
@@ -457,24 +627,32 @@ function App(){
 
     React.createElement("div",{style:{padding:"16px 20px",display:"flex",flexDirection:"column",gap:14}},
 
-      // ── TAB MARCHÉS ──
+      // ── MARCHÉS ──
       tab==="markets"&&React.createElement(React.Fragment,null,
         // Stats
-        React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}},
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}},
           React.createElement("div",{className:"card",style:{textAlign:"center"}},
             React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:4}},"P&L TOTAL"),
             React.createElement("div",{style:{fontSize:22,fontWeight:800,
               color:pnl>=0?"#00e5a0":"#ff4560",fontFamily:"'DM Mono',monospace"}},
-              (pnl>=0?"+":"")+pnl.toFixed(2)+" $")),
+              (pnl>=0?"+":"")+pnl.toFixed(2)+"$")),
           React.createElement("div",{className:"card",style:{textAlign:"center"}},
             React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:4}},"WIN RATE"),
             React.createElement("div",{style:{fontSize:22,fontWeight:800,
               color:+wr>=50?"#00e5a0":"#f5a623",fontFamily:"'DM Mono',monospace"}},wr+"%"),
             React.createElement("div",{style:{fontSize:10,color:"#444"}},trades.length+" trades"))),
+        // Risque dynamique
+        riskMult<1&&React.createElement("div",{className:"card",style:{background:"#f5a62310",borderColor:"#f5a62340"}},
+          React.createElement("div",{style:{fontSize:12,color:"#f5a623",lineHeight:1.6}},
+            `⚠️ Risque réduit à ${riskMult*100}% après ${consecutiveLosses} pertes consécutives. Le bot protège votre capital automatiquement.`)),
+        // Session
+        !sessionActive&&config?.sessionOnly&&React.createElement("div",{className:"card",style:{background:"#ffffff05",borderColor:"#ffffff10"}},
+          React.createElement("div",{style:{fontSize:12,color:"#555",textAlign:"center"}},
+            "🌙 Hors session London + NY — Le bot attend l'ouverture des marchés")),
         // Positions actives
         positions.length>0&&React.createElement("div",null,
           React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:10}},
-            "POSITIONS ACTIVES ("+positions.length+")"),
+            "POSITIONS ACTIVES ("+positions.length+"/"+( config?.maxPositions||3)+")"),
           positions.map(pos=>{
             const px=markets[pos.pair]?.price||pos.entry;
             const upnl=pos.side==="LONG"?(px-pos.entry)*pos.qty:(pos.entry-px)*pos.qty;
@@ -495,20 +673,19 @@ function App(){
                 width:"100%",padding:"8px 0",borderRadius:10,background:"#ff456010",
                 border:"1px solid #ff456030",color:"#ff4560",fontSize:12,fontWeight:700,
                 cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},"⏹ Fermer"));})),
-        // Liste paires
+        // Liste marchés
         React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:6}},"MARCHÉS SURVEILLÉS"),
         PAIRS.map(pair=>{
           const m=markets[pair];const up=(m?.change||0)>=0;
           return React.createElement("div",{key:pair,className:"card",
             onClick:()=>setDetail(pair),
-            style:{marginBottom:10,padding:"14px 16px",cursor:"pointer",transition:"border .2s"}},
+            style:{marginBottom:10,padding:"14px 16px",cursor:"pointer"}},
             React.createElement("div",{style:{display:"flex",alignItems:"center"}},
               React.createElement("div",{style:{flex:1}},
                 React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:4}},
                   React.createElement("span",{style:{fontSize:15,fontWeight:700,color:"#fff"}},pair.split("/")[0]),
                   React.createElement("span",{style:{fontSize:10,color:"#444"}},"/USDT"),
-                  loading[pair]?React.createElement("div",{className:"loader",style:{width:12,height:12}})
-                    :React.createElement(Badge,{signal:m?.signal||"WAIT"})),
+                  loading[pair]?React.createElement("div",{className:"loader",style:{width:12,height:12}}):React.createElement(Badge,{signal:m?.signal||"WAIT"})),
                 React.createElement("div",{style:{fontSize:12,color:up?"#00e5a0":"#ff4560"}},
                   (up?"▲":"▼")+" "+Math.abs(m?.change||0).toFixed(2)+"%")),
               React.createElement("div",{style:{width:90,margin:"0 10px"}},
@@ -518,16 +695,40 @@ function App(){
                   m?.price?m.price.toLocaleString("fr-FR",{maximumFractionDigits:pair.includes("XRP")?5:2}):"…"),
                 React.createElement("div",{style:{fontSize:10,color:"#444"}},"›"))));})),
 
-      // ── TAB TRADES ──
+      // ── TRADES ──
       tab==="trades"&&React.createElement(React.Fragment,null,
         React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:4}},
           [["TRADES",trades.length,"#aaa"],["GAGNANTS",wins,"#00e5a0"],["PERDANTS",trades.length-wins,"#ff4560"]].map(([l,v,c])=>
             React.createElement("div",{key:l,className:"card",style:{textAlign:"center"}},
               React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:4}},l),
               React.createElement("div",{style:{fontSize:20,fontWeight:800,color:c,fontFamily:"'DM Mono',monospace"}},v)))),
+        // Statistiques avancées
+        trades.length>0&&React.createElement("div",{className:"card"},
+          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"STATISTIQUES AVANCÉES"),
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}},
+            [["Gain moyen","+"+avgWin.toFixed(3)+"$","#00e5a0"],
+             ["Perte moyenne","-"+avgLoss.toFixed(3)+"$","#ff4560"],
+             ["Ratio G/P",(avgLoss>0?(avgWin/avgLoss).toFixed(2):"∞"),"#f5a623"],
+             ["Pertes consécutives",consecutiveLosses,consecutiveLosses>=2?"#ff4560":"#aaa"]
+            ].map(([l,v,c])=>
+              React.createElement("div",{key:l,style:{background:"rgba(255,255,255,.03)",borderRadius:10,padding:"10px 12px"}},
+                React.createElement("div",{style:{fontSize:10,color:"#555",marginBottom:4}},l),
+                React.createElement("div",{style:{fontSize:14,fontWeight:700,color:c,fontFamily:"'DM Mono',monospace"}},v))))),
+        // Graphique PnL hebdomadaire
+        React.createElement("div",{className:"card"},
+          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"P&L CETTE SEMAINE"),
+          React.createElement("div",{style:{display:"flex",gap:4,alignItems:"flex-end",height:60}},
+            ["D","L","M","M","J","V","S"].map((day,i)=>{
+              const val=weeklyPnl[i]||0;
+              const maxV=Math.max(...weeklyPnl.map(Math.abs))||1;
+              const h=Math.max(4,(Math.abs(val)/maxV)*52);
+              return React.createElement("div",{key:i,style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}},
+                React.createElement("div",{style:{width:"100%",height:h,
+                  background:val>=0?"#00e5a0":"#ff4560",borderRadius:4,opacity:val===0?.3:1}}),
+                React.createElement("div",{style:{fontSize:9,color:"#555"}},day));}))
+        ),
         trades.length===0
-          ?React.createElement("div",{style:{textAlign:"center",color:"#444",fontSize:14,marginTop:40,lineHeight:2}},
-            "Aucun trade pour l'instant.\nDémarrez le bot pour commencer.")
+          ?React.createElement("div",{style:{textAlign:"center",color:"#444",fontSize:14,marginTop:40}},"Aucun trade pour l'instant.")
           :trades.map(t=>React.createElement("div",{key:t.id,className:"card",style:{marginBottom:10}},
               React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
                 React.createElement("div",{style:{display:"flex",gap:8,alignItems:"center"}},
@@ -540,55 +741,77 @@ function App(){
                 React.createElement("span",null,t.entry?.toFixed(4)," → ",t.exit?.toFixed(4)),
                 React.createElement("span",null,t.reason))))),
 
-      // ── TAB WALLET ──
+      // ── WALLET ──
       tab==="wallet"&&React.createElement(React.Fragment,null,
-        React.createElement("div",{className:"card",style:{textAlign:"center",padding:"28px 20px"}},
+        React.createElement("div",{className:"card",style:{textAlign:"center",padding:"24px 20px"}},
           React.createElement("div",{style:{fontSize:11,color:"#555",marginBottom:8}},"P&L CUMULÉ"),
-          React.createElement("div",{style:{fontSize:36,fontWeight:900,
+          React.createElement("div",{style:{fontSize:34,fontWeight:900,
             color:pnl>=0?"#00e5a0":"#ff4560",fontFamily:"'DM Mono',monospace"}},
             (pnl>=0?"+":"")+pnl.toFixed(4)+" USDT"),
           React.createElement("div",{style:{fontSize:12,color:"#444",marginTop:6}},
             "Capital: "+config.capital+" USDT · "+config.network)),
+        // Statut Telegram
+        React.createElement("div",{className:"card",style:{
+          borderColor:config.tgToken?"rgba(0,229,160,.3)":"rgba(255,255,255,.1)"}},
+          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"ALERTES TELEGRAM"),
+          config.tgToken
+            ?React.createElement("div",null,
+              React.createElement("div",{style:{fontSize:13,color:"#00e5a0",marginBottom:12}},"✅ Telegram configuré et actif"),
+              React.createElement("button",{onClick:()=>tg("🧪 <b>Test VOLBOT</b>\nVos alertes Telegram fonctionnent correctement !"),style:{
+                width:"100%",padding:12,borderRadius:12,background:"#00e5a018",
+                border:"1px solid #00e5a040",color:"#00e5a0",fontSize:13,
+                fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
+                "📨 Envoyer un message test"))
+            :React.createElement("div",{style:{fontSize:13,color:"#555"}},
+              "❌ Non configuré — Reconfigurez pour activer les alertes")),
         // Dépôt
         React.createElement("div",{className:"card"},
           React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"RECEVOIR DES USDT"),
           depAddr
             ?React.createElement("div",null,
               React.createElement("div",{style:{background:"#00e5a010",border:"1px solid #00e5a030",
-                borderRadius:12,padding:"14px 16px",fontSize:12,fontFamily:"'DM Mono',monospace",
+                borderRadius:12,padding:"14px 16px",fontSize:11,fontFamily:"'DM Mono',monospace",
                 color:"#00e5a0",wordBreak:"break-all",marginBottom:12,lineHeight:1.6}},depAddr),
               React.createElement("button",{onClick:()=>{
                 if(navigator.clipboard)navigator.clipboard.writeText(depAddr);
-                toast2("✅ Adresse copiée !");},
-                style:{width:"100%",padding:12,borderRadius:12,background:"#00e5a018",
-                  border:"1px solid #00e5a040",color:"#00e5a0",fontSize:13,
-                  fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
+                toast2("✅ Adresse copiée !");},style:{
+                width:"100%",padding:12,borderRadius:12,background:"#00e5a018",
+                border:"1px solid #00e5a040",color:"#00e5a0",fontSize:13,
+                fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
                 "📋 Copier l'adresse"))
-            :React.createElement("button",{onClick:()=>setDepAddr("Connectez-vous à Binance → Portefeuille → Dépôt → USDT → "+config.network),
-              style:{width:"100%",padding:14,borderRadius:12,background:"#00e5a018",
-                border:"1px solid #00e5a040",color:"#00e5a0",fontSize:14,fontWeight:700,
-                cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
+            :React.createElement("button",{onClick:()=>setDepAddr("Connectez-vous à Binance → Portefeuille → Dépôt → USDT → "+config.network+" pour obtenir votre adresse"),style:{
+              width:"100%",padding:14,borderRadius:12,background:"#00e5a018",
+              border:"1px solid #00e5a040",color:"#00e5a0",fontSize:14,
+              fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
               "📥 Voir mon adresse de dépôt")),
-        // Config
+        // Config résumé
         React.createElement("div",{className:"card"},
-          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"CONFIGURATION"),
+          React.createElement("div",{style:{fontSize:11,color:"#555",letterSpacing:".1em",marginBottom:12}},"CONFIGURATION ACTIVE"),
           [["Exchange",config.exchange],["Capital",config.capital+" USDT"],
-           ["Risque/trade",config.risk+"%"],["Stop-Loss",config.sl+"%"],
-           ["Take-Profit",config.tp+"%"],["Réseau",config.network]].map(([l,v])=>
+           ["Risque/trade",config.risk+"%"],["SL / TP",config.sl+"% / "+config.tp+"%"],
+           ["Max positions",config.maxPositions||3],["Réseau",config.network],
+           ["Session only",config.sessionOnly?"Oui":"Non"],
+           ["Auto-retrait",config.autoWithdrawPct>0?config.autoWithdrawPct+"%":"Désactivé"],
+           ["Telegram",config.tgToken?"Actif":"Inactif"]
+          ].map(([l,v])=>
             React.createElement("div",{key:l,style:{display:"flex",justifyContent:"space-between",
-              padding:"9px 0",borderBottom:"1px solid rgba(255,255,255,.05)",fontSize:13}},
+              padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,.05)",fontSize:13}},
               React.createElement("span",{style:{color:"#555"}},l),
               React.createElement("span",{style:{color:"#ccc",fontFamily:"'DM Mono',monospace"}},v)))),
-        React.createElement("button",{onClick:()=>{S.set("volbot_config",null);window.location.reload();},
-          style:{width:"100%",padding:14,borderRadius:14,background:"transparent",
-            border:"1px solid rgba(255,255,255,.08)",color:"#555",
-            fontSize:13,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
-          "⚙️ Reconfigurer le bot"))),
+        React.createElement("button",{onClick:()=>{
+          S.set("volbot_config",null);S.set("volbot_positions",[]);
+          S.set("volbot_pnl",0);S.set("volbot_losses",0);
+          window.location.reload();},style:{
+          width:"100%",padding:14,borderRadius:14,background:"transparent",
+          border:"1px solid rgba(255,255,255,.08)",color:"#555",
+          fontSize:13,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}},
+          "⚙️ Reconfigurer VOLBOT"))),
 
     // Bottom nav
     React.createElement("div",{style:{position:"fixed",bottom:0,left:0,right:0,
       background:"rgba(7,10,18,.96)",backdropFilter:"blur(20px)",
-      borderTop:"1px solid rgba(255,255,255,.07)",display:"flex",padding:"6px 0 20px"}},
+      borderTop:"1px solid rgba(255,255,255,.07)",
+      display:"flex",padding:"6px 0 20px"}},
       tabBtn("markets","📊","Marchés"),tabBtn("trades","📋","Trades"),tabBtn("wallet","💼","Wallet")),
 
     React.createElement(Toast,{msg:toast,onClose:()=>setToast(null)}));
@@ -598,3 +821,4 @@ ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(
 </script>
 </body>
 </html>
+                 
